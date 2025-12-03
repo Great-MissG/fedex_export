@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import base64
 import json
+import pandas as pd
 from typing import Optional, Dict, Any, List
 
 # 页面配置
@@ -10,10 +11,6 @@ st.set_page_config(
     page_icon="📍",
     layout="wide"
 )
-
-# 初始化 session state
-if 'api_key' not in st.session_state:
-    st.session_state.api_key = ""
 
 def get_auth_header(key: str) -> str:
     """生成 Basic Authentication header"""
@@ -182,7 +179,7 @@ def parse_dimensions(dims_v_str: str) -> Dict[str, str]:
             elif len(parts) == 2:
                 result['length'] = parts[0].strip()
                 result['width'] = parts[1].strip()
-    except Exception as e:
+    except Exception:
         pass
     
     return result
@@ -203,8 +200,8 @@ def extract_required_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     fields['VOLUME'] = volume if volume is not None else ''
     
     # dimensions.dims[3].t
-    dims = extract_field_value(result, 'dimensions.dims[3].t')
-    fields['dimensions.dims[3].t'] = dims if dims is not None else 'NONE'
+    dims_t = extract_field_value(result, 'dimensions.dims[3].t')
+    fields['dimensions.dims[3].t'] = dims_t if dims_t is not None else 'NONE'
     
     # dimensions.dims[3].v
     dims_v = extract_field_value(result, 'dimensions.dims[3].v')
@@ -300,26 +297,16 @@ def format_fields_recursive(data: Any, prefix: str = "", depth: int = 0, max_dep
 st.title("📍 Beans.ai Tracking ID 查询工具")
 st.markdown("---")
 
-# API Key 输入
-st.header("🔐 API 配置")
-api_key = st.text_input(
-    "API Key",
-    value=st.session_state.api_key,
-    type="password",
-    help="请输入您的 Beans.ai API Key。支持以下格式：\n1. Basic {encoded} 格式（完整认证字符串）\n2. key:secret 格式\n3. 单独的 key"
-)
+# 🔐 认证：从 Streamlit Secrets 读取，不在页面上输入
+# 在 Streamlit Cloud 的 Secrets 中配置：
+# BEANS_API_AUTH_BASIC = "Basic xxxxxx"  或者是 key / key:secret
+secret_key = st.secrets.get("BEANS_API_AUTH_BASIC", "").strip()
 
-if api_key:
-    st.session_state.api_key = api_key
-
-st.markdown("---")
-
-# 检查认证信息
-if not st.session_state.api_key:
-    st.warning("⚠️ 请输入 API Key")
+if not secret_key:
+    st.error("❌ 未在 Secrets 中找到 BEANS_API_AUTH_BASIC，请在 Streamlit 控制台的 Secrets 中配置。")
     st.stop()
 
-auth_header = get_auth_header(st.session_state.api_key)
+auth_header = get_auth_header(secret_key)
 
 # Tracking ID 输入
 st.header("📋 Tracking ID 查询")
@@ -345,17 +332,17 @@ if st.button("🔍 查询", type="primary", use_container_width=True):
         
         # 处理每个 Tracking ID
         all_results = []
+        summary_rows = []  # 汇总到一张表里的行
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # 使用新的 API: Get Stop By Tracking ID
+        # 使用 API: Get Stop By Tracking ID
         base_url = "https://isp.beans.ai/enterprise/v1/lists/item_by_tracking_id"
         
         for idx, tracking_id in enumerate(tracking_ids):
             status_text.text(f"处理中: {idx + 1}/{len(tracking_ids)} - {tracking_id}")
             progress_bar.progress((idx + 1) / len(tracking_ids))
             
-            # 构建请求参数（只需要 tracking_id）
             params = {
                 "tracking_id": tracking_id
             }
@@ -366,49 +353,104 @@ if st.button("🔍 查询", type="primary", use_container_width=True):
             
             result = make_request(base_url, headers, params)
             
-            all_results.append({
+            record = {
                 "tracking_id": tracking_id,
                 "status": "成功" if result else "失败",
-                "result": result
-            })
+                "result": result,
+            }
+            all_results.append(record)
+
+            # 如果有结果，提取为“汇总表”的一行
+            if result:
+                required_fields = extract_required_fields(result)
+                row = {
+                    # 统一成 Excel 表头形式：一行一个 tracking
+                    "trackingId": tracking_id,  # 以用户输入为准
+                    "WEIGHT": required_fields.get("WEIGHT", ""),
+                    "VOLUME": required_fields.get("VOLUME", ""),
+                    "length": required_fields.get("length", ""),
+                    "width": required_fields.get("width", ""),
+                    "height": required_fields.get("height", ""),
+                    "shipperNote": required_fields.get("shipperNote", ""),
+                    "address": required_fields.get("address", ""),
+                    "customerName": required_fields.get("customerName", ""),
+                    "customerPhone": required_fields.get("customerPhone", ""),
+                    "dimensions.dims[3].t": required_fields.get("dimensions.dims[3].t", ""),
+                    "dimensions.dims[3].v": required_fields.get("dimensions.dims[3].v", ""),
+                    "dimensions.dims[0].v": required_fields.get("dimensions.dims[0].v", ""),
+                    "dimensions.dims[1].v": required_fields.get("dimensions.dims[1].v", ""),
+                }
+                summary_rows.append(row)
         
         progress_bar.empty()
         status_text.empty()
         
-        # 显示结果
         st.markdown("---")
         st.success(f"✅ 查询完成！共处理 {len(tracking_ids)} 个 Tracking ID")
-        
-        # 为每个结果显示字段列表
+
+        # 📊 先给一张 “所有 tracking 汇总表”（方便直接导出到 Excel）
+        if summary_rows:
+            st.subheader("📊 所有 Tracking ID 汇总表（Excel 表头格式）")
+
+            # 确保列顺序固定
+            columns_order = [
+                "trackingId",
+                "WEIGHT", "VOLUME",
+                "length", "width", "height",
+                "shipperNote", "address",
+                "customerName", "customerPhone",
+                "dimensions.dims[3].t",
+                "dimensions.dims[3].v",
+                "dimensions.dims[0].v",
+                "dimensions.dims[1].v",
+            ]
+            df_summary = pd.DataFrame(summary_rows)
+
+            # 保证即便有些列缺失也不会报错
+            for col in columns_order:
+                if col not in df_summary.columns:
+                    df_summary[col] = ""
+
+            df_summary = df_summary[columns_order]
+
+            st.dataframe(df_summary, use_container_width=True)
+
+            csv_all = df_summary.to_csv(index=False, encoding="utf-8-sig")
+            st.download_button(
+                label="📥 下载所有 Tracking 的汇总 CSV（可直接用 Excel 打开）",
+                data=csv_all,
+                file_name="beans_tracking_summary.csv",
+                mime="text/csv",
+            )
+
+        # 下面保留每个 tracking 的详细信息 / 调试信息（如果你不需要可以整体删掉这一段）
+        st.markdown("---")
+        st.subheader("🔎 每个 Tracking ID 详细结果")
+
         for idx, result_item in enumerate(all_results):
             tracking_id = result_item["tracking_id"]
             result = result_item.get("result", {})
             
             if result:
-                st.subheader(f"📋 Tracking ID: `{tracking_id}` - 查询结果")
                 st.markdown("---")
+                st.markdown(f"### 📋 Tracking ID: `{tracking_id}` - 查询结果")
                 
                 # 提取需要的字段
                 required_fields = extract_required_fields(result)
                 
                 # 显示关键字段表格
-                st.markdown("### 📊 关键字段")
-                import pandas as pd
+                st.markdown("#### 📊 关键字段（单条查看用）")
                 
-                # 如果 WEIGHT 或 VOLUME 为空，尝试在原始 JSON 中查找相关字段
                 weight_value = required_fields.get('WEIGHT', '')
                 volume_value = required_fields.get('VOLUME', '')
                 
                 # 如果没找到，显示调试信息并搜索相关字段
                 if not weight_value or not volume_value:
-                    with st.expander("🔍 调试信息：查找 WEIGHT 和 VOLUME 字段", expanded=True):
+                    with st.expander("🔍 调试信息：查找 WEIGHT 和 VOLUME 字段", expanded=False):
                         st.warning("⚠️ WEIGHT 或 VOLUME 字段未找到，正在搜索相关字段...")
-                        
-                        # 搜索包含 weight 或 volume 的所有字段
                         search_results = search_fields_recursive(result, ['weight', 'volume'])
                         if search_results:
                             st.info(f"找到 {len(search_results)} 个相关字段：")
-                            import pandas as pd
                             search_df = pd.DataFrame(search_results)
                             st.dataframe(search_df, use_container_width=True)
                             st.caption("💡 提示：如果看到相关字段，请告诉我实际的字段路径，我会更新代码")
@@ -416,7 +458,7 @@ if st.button("🔍 查询", type="primary", use_container_width=True):
                             st.info("未找到包含 'weight' 或 'volume' 的字段。请查看原始 JSON 数据。")
                 
                 fields_df = pd.DataFrame([
-                    {"字段": "trackingId", "值": required_fields.get('trackingId', '')},
+                    {"字段": "trackingId", "值": tracking_id},
                     {"字段": "WEIGHT", "值": weight_value if weight_value else "⚠️ 未找到"},
                     {"字段": "VOLUME", "值": volume_value if volume_value else "⚠️ 未找到"},
                     {"字段": "length", "值": required_fields.get('length', '')},
@@ -429,40 +471,33 @@ if st.button("🔍 查询", type="primary", use_container_width=True):
                 ])
                 st.dataframe(fields_df, use_container_width=True, hide_index=True)
                 
-                # 下载关键字段（CSV格式）
+                # 下载当前 tracking 的关键字段（按原来逻辑保留）
                 csv_data = fields_df.to_csv(index=False, encoding='utf-8-sig')
                 st.download_button(
-                    label=f"📥 下载关键字段 (CSV) - {tracking_id}",
+                    label=f"📥 下载该 Tracking 的关键字段 (CSV) - {tracking_id}",
                     data=csv_data,
                     file_name=f"fields_{tracking_id}.csv",
                     mime="text/csv",
                     key=f"download_csv_{tracking_id}_{idx}"
                 )
                 
-                st.markdown("---")
-                st.markdown("### 📋 所有字段列表")
-                
-                # 格式化显示所有字段
+                # 所有字段列表（文本）
+                st.markdown("#### 📋 所有字段列表（缩进展示）")
                 fields_list = format_fields_recursive(result)
                 fields_text = "\n".join(fields_list)
-                
-                # 使用代码块显示，保持格式
                 st.code(fields_text, language="text")
                 
-                # 下载所有字段按钮
                 st.download_button(
-                    label=f"📥 下载所有字段列表 (TXT) - {tracking_id}",
+                    label=f"📥 下载该 Tracking 的所有字段列表 (TXT) - {tracking_id}",
                     data=fields_text,
                     file_name=f"all_fields_{tracking_id}.txt",
                     mime="text/plain",
                     key=f"download_all_{tracking_id}_{idx}"
                 )
                 
-                # 显示原始 JSON（可折叠）
+                # 原始 JSON
                 with st.expander(f"📄 查看原始 JSON 数据 - {tracking_id}"):
                     st.json(result)
-                
-                st.markdown("---")
             else:
                 st.warning(f"⚠️ Tracking ID `{tracking_id}` 查询失败或无数据")
                 st.markdown("---")
@@ -471,14 +506,16 @@ if st.button("🔍 查询", type="primary", use_container_width=True):
 st.markdown("---")
 st.markdown("### 📖 使用说明")
 st.markdown("""
-1. 在上方输入您的 **API Key**（可以是 key:secret 格式，或单独的 key）
-2. 在文本框中粘贴 **Tracking ID**（可以粘贴单个或多个，每行一个）
-3. 点击查询按钮获取结果
+1. 在 **Streamlit 控制台的 Secrets** 中配置 `BEANS_API_AUTH_BASIC`（不要在页面上填 key）
+2. 在文本框中粘贴 **多个 Tracking ID**（每行一个）
+3. 点击查询按钮，会生成：
+   - 一张所有 Tracking 的 **汇总表**（表头即 Excel 列名）
+   - 每个 Tracking 的详细字段、调试信息和原始 JSON
 
 **API 信息**: 
 - 使用 **Get Stop By Tracking ID** API
 - 端点: `https://isp.beans.ai/enterprise/v1/lists/item_by_tracking_id`
-- 只需提供 Tracking ID，无需地址等其他参数
+- 只需提供 Tracking ID
 
-**注意**: 所有 API 请求都需要有效的认证信息。请确保您已注册 Beans.ai 企业账户并获取了 API 密钥。
+**注意**: 所有 API 请求都需要有效的认证信息。请确保您已在 Secrets 中正确配置密钥。
 """)
